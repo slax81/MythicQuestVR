@@ -256,9 +256,20 @@ export class DownloadProcessor {
       // Create download directory
       await fs.mkdir(downloadPath, { recursive: true })
 
-      // Create mount point directory
-      await fs.mkdir(mountPoint, { recursive: true })
-      console.log(`[DownProc] Created mount point: ${mountPoint}`)
+      // On Windows with WinFsp, the mount point directory should NOT exist beforehand
+      // WinFsp creates it during mount. On Linux/Mac, it should exist.
+      if (process.platform !== 'win32') {
+        await fs.mkdir(mountPoint, { recursive: true })
+        console.log(`[DownProc] Created mount point: ${mountPoint}`)
+      } else {
+        // Ensure mount point doesn't exist on Windows (WinFsp requirement)
+        try {
+          await fs.rmdir(mountPoint)
+        } catch {
+          // Directory doesn't exist, that's fine
+        }
+        console.log(`[DownProc] Mount point will be created by WinFsp: ${mountPoint}`)
+      }
 
       // Check available disk space
       const availableSpace = await getAvailableDiskSpace(item.downloadPath)
@@ -341,15 +352,35 @@ export class DownloadProcessor {
 
       // Wait for mount to be ready with timeout and verification
       let mountReady = false
+      let mountError: string | null = null
+
+      // Capture mount process errors
+      mountProcess.catch((error) => {
+        console.error(`[DownProc] Mount process error:`, error.message || error)
+        if (error.stderr) {
+          console.error(`[DownProc] Mount stderr:`, error.stderr)
+        }
+        mountError = error.message || 'Mount process failed'
+      })
+
       for (let i = 0; i < 10; i++) {
         await new Promise((resolve) => setTimeout(resolve, 1000))
+
+        // Check if mount process has exited (failed)
+        if (mountProcess.exitCode !== null) {
+          console.error(`[DownProc] Mount process exited with code ${mountProcess.exitCode}`)
+          break // Mount failed, don't keep waiting
+        }
+
         try {
           const testRead = await fs.readdir(mountPoint)
-          if (testRead.length >= 0) {
-            // Even empty directory means mount is working
+          if (testRead.length > 0) {
+            // Must have actual content, not just empty dir we created
             mountReady = true
             console.log(`[DownProc] Mount ready after ${i + 1} seconds`)
             break
+          } else {
+            console.log(`[DownProc] Mount directory empty, attempt ${i + 1}/10`)
           }
         } catch {
           console.log(`[DownProc] Mount not ready yet, attempt ${i + 1}/10`)
@@ -357,7 +388,8 @@ export class DownloadProcessor {
       }
 
       if (!mountReady) {
-        throw new Error('Mount failed to become ready within 10 seconds')
+        const errorMsg = mountError || 'Mount failed to become ready within 10 seconds'
+        throw new Error(errorMsg)
       }
 
       // Verify mount contents are accessible and download all files
@@ -590,11 +622,13 @@ export class DownloadProcessor {
       console.log(`[DownProc] Cleaning up mount point: ${mountPoint}`)
 
       // Stop mount process if it exists
+      let mountProcessKilled = false
       if (releaseName) {
         const downloadController = this.activeDownloads.get(releaseName)
         if (downloadController?.mountProcess) {
           try {
             downloadController.mountProcess.kill('SIGTERM')
+            mountProcessKilled = true
             console.log(`[DownProc] Terminated mount process for ${releaseName}`)
           } catch (killError) {
             console.warn(`[DownProc] Failed to kill mount process for ${releaseName}:`, killError)
@@ -602,27 +636,41 @@ export class DownloadProcessor {
         }
       }
 
-      // Try to unmount
-      try {
-        if (process.platform === 'linux') {
-          await execa('fusermount', ['-u', mountPoint])
-        } else if (process.platform === 'darwin') {
-          await execa('umount', [mountPoint])
-        } else if (process.platform === 'win32') {
-          // Windows unmount is handled by rclone daemon
-          await execa('taskkill', ['/F', '/IM', 'rclone.exe'])
+      // Try to unmount (only if we didn't already kill the mount process)
+      if (!mountProcessKilled) {
+        try {
+          if (process.platform === 'linux') {
+            await execa('fusermount', ['-u', mountPoint])
+          } else if (process.platform === 'darwin') {
+            await execa('umount', [mountPoint])
+          }
+          // On Windows, the mount is handled by the rclone process we already killed above
+          // No need to run taskkill which could kill unrelated rclone instances
+          console.log(`[DownProc] Successfully unmounted ${mountPoint}`)
+        } catch (unmountError) {
+          console.warn(`[DownProc] Failed to unmount ${mountPoint}:`, unmountError)
         }
-        console.log(`[DownProc] Successfully unmounted ${mountPoint}`)
-      } catch (unmountError) {
-        console.warn(`[DownProc] Failed to unmount ${mountPoint}:`, unmountError)
       }
 
-      // Remove mount directory
+      // Wait a moment for unmount to complete on Windows
+      if (process.platform === 'win32') {
+        await new Promise((resolve) => setTimeout(resolve, 500))
+      }
+
+      // Remove mount directory (may fail on Windows if WinFsp already removed it)
       try {
         await fs.rmdir(mountPoint)
         console.log(`[DownProc] Removed mount directory ${mountPoint}`)
-      } catch (removeError) {
-        console.warn(`[DownProc] Failed to remove mount directory ${mountPoint}:`, removeError)
+      } catch (removeError: unknown) {
+        // On Windows with WinFsp, the directory is removed automatically when unmounted
+        if (
+          removeError instanceof Error &&
+          (removeError.message.includes('ENOENT') || removeError.message.includes('no such file'))
+        ) {
+          console.log(`[DownProc] Mount directory ${mountPoint} already removed by WinFsp`)
+        } else {
+          console.warn(`[DownProc] Failed to remove mount directory ${mountPoint}:`, removeError)
+        }
       }
     } catch (cleanupError) {
       console.error(`[DownProc] Cleanup error for ${mountPoint}:`, cleanupError)
